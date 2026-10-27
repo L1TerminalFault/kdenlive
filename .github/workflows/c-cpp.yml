@@ -8,7 +8,7 @@ on:
         required: false
         default: "master"
       build_type:
-        description: "Build type (RelWithDebInfo matches KDE's prebuilt binary cache; others rebuild every dependency from source and will not fit in the time limit)"
+        description: "Build type (RelWithDebInfo matches KDE's prebuilt binary cache)"
         required: false
         default: "RelWithDebInfo"
         type: choice
@@ -17,7 +17,7 @@ on:
           - Release
           - Debug
       craft_ref:
-        description: "Craft revision (commit SHA, or 'master'). Default pins the last commit before Craft's bootstrap switched to a from-source curl build whose binary cache is not published yet"
+        description: "Craft revision (commit SHA or 'master'). Pin a known-good commit if bootstrap breaks."
         required: false
         default: "1b3bc65448faedea76758752bc77c448670ba43c"
       package:
@@ -64,34 +64,31 @@ jobs:
           python-version: "3.12"
           architecture: x64
 
-      # invent.kde.org returns "403 Forbidden" to plain HTTP downloads from GitHub's
-      # runners (it blocks scripted/non-browser clients), so we never download from it
-      # over HTTP. Craft itself is cloned from KDE's official GitHub mirror and passed
-      # to the bootstrap via --localDev.
-      #
-      # Craft later clones its blueprints and the Kdenlive source over git. If git
-      # access to invent.kde.org works from this runner we leave it alone; if not, we
-      # transparently redirect those clones to the matching GitHub mirrors.
+      # invent.kde.org returns 403 to plain HTTP from GitHub runners, so we
+      # never download from it over HTTP. Craft is cloned from the GitHub
+      # mirror. Later git clones are redirected to GitHub mirrors if needed.
       - name: Bootstrap Craft
         shell: pwsh
         run: |
           python -m pip install --upgrade certifi
 
-          # --- git access check / mirror fallback -------------------------------------
+          # --- git access check / mirror fallback ---------------------------------
           $ErrorActionPreference = 'Continue'
           git ls-remote https://invent.kde.org/packaging/craft-blueprints-kde.git HEAD *> $null
           $inventOk = ($LASTEXITCODE -eq 0)
           $ErrorActionPreference = 'Stop'
+
           if ($inventOk) {
             Write-Host "invent.kde.org git access works - using it directly."
           } else {
             Write-Warning "invent.kde.org not reachable via git - redirecting clones to GitHub mirrors."
-            git config --global url."https://github.com/KDE/craft".insteadOf       "https://invent.kde.org/packaging/craft"
-            git config --global url."https://github.com/KDE/kdenlive".insteadOf    "https://invent.kde.org/multimedia/kdenlive"
-            git config --global url."https://github.com/KDE/kshim".insteadOf       "https://invent.kde.org/sdk/kshim"
+            git config --global url."https://github.com/KDE/craft".insteadOf            "https://invent.kde.org/packaging/craft"
+            git config --global url."https://github.com/KDE/kdenlive".insteadOf         "https://invent.kde.org/multimedia/kdenlive"
+            git config --global url."https://github.com/KDE/kshim".insteadOf            "https://invent.kde.org/sdk/kshim"
+            git config --global url."https://github.com/KDE/craft-blueprints-kde".insteadOf "https://invent.kde.org/packaging/craft-blueprints-kde"
           }
 
-          # --- get Craft from the GitHub mirror ---------------------------------------
+          # --- get Craft from the GitHub mirror -----------------------------------
           $craftSrc = Join-Path $env:RUNNER_TEMP "craft-src"
           New-Item -ItemType Directory -Force -Path $craftSrc | Out-Null
           git -C $craftSrc init -q
@@ -102,7 +99,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Could not check out Craft revision $env:KD_CRAFT_REF" }
           Write-Host ("Craft revision: " + (git -C $craftSrc log -1 --format='%h %ad %s' --date=short))
 
-          # --- bootstrap (non-interactive) --------------------------------------------
+          # --- bootstrap (non-interactive) ----------------------------------------
           New-Item -ItemType Directory -Force -Path "$env:CRAFT_ROOT\download" | Out-Null
           python "$craftSrc\setup\CraftBootstrap.py" `
             --prefix "$env:CRAFT_ROOT" `
@@ -111,9 +108,8 @@ jobs:
             --use-defaults
           if ($LASTEXITCODE -ne 0) { throw "Craft bootstrap failed ($LASTEXITCODE)" }
 
-          # The last bootstrap step (craft/craft-core) installs Craft's *current* master over
-          # the pinned copy. Put the pinned revision back so later `craft` runs keep the
-          # old, cache-friendly bootstrap requirements.
+          # Put the pinned revision back so later craft runs keep the
+          # cache-friendly bootstrap requirements.
           $craftDir = Join-Path $env:CRAFT_ROOT "craft"
           if (Test-Path (Join-Path $craftDir ".git")) {
             git -C $craftDir fetch -q --depth 1 https://github.com/KDE/craft.git $env:KD_CRAFT_REF
@@ -131,16 +127,15 @@ jobs:
           Write-Host "Craft ABI -> $abi"
           if ($abi -notmatch 'msvc2022') { throw "Unexpected ABI: $abi" }
 
-      # Craft master points at binary-cache version "26.10", which KDE has not published
-      # yet (files.kde.org answers 404), so every dependency would be compiled from
-      # source and the build would run out of time. This step probes the published cache
-      # versions, newest first, and pins the first one that exists.
+      # Only RelWithDebInfo caches exist for MSVC 2022. Never require MinSizeRel.
       - name: Select an available binary cache
         shell: pwsh
         run: |
           $ini = "$env:CRAFT_ROOT\etc\CraftSettings.ini"
-          # Versions that exist on https://files.kde.org/craft/Qt6/ (newest first).
+
+          # Newest first. 26.10 is published but Windows CI is still catching up.
           $candidates = @("26.10", "26.05", "26.02")
+
           function Test-Manifest($v, $bt) {
             $url = "https://files.kde.org/craft/Qt6/$v/windows/cl/msvc2022/x86_64/$bt/manifest.json"
             curl.exe -s -f -L -I -o NUL $url
@@ -148,39 +143,81 @@ jobs:
             Write-Host ("  {0,-10} {1,-15} {2}" -f $v, $bt, $(if ($ok) { "found" } else { "missing" }))
             return $ok
           }
+
           $chosen = $null
-          # Pass 1: a version that has BOTH RelWithDebInfo (Kdenlive + libs) and MinSizeRel (Craft's dev-utils).
           foreach ($v in $candidates) {
-            if ((Test-Manifest $v "RelWithDebInfo") -and (Test-Manifest $v "MinSizeRel")) { $chosen = $v; break }
+            if (Test-Manifest $v "RelWithDebInfo") {
+              $chosen = $v
+              break
+            }
           }
-          # Pass 2: a version with at least RelWithDebInfo.
+
           if (-not $chosen) {
-            foreach ($v in $candidates) { if (Test-Manifest $v "RelWithDebInfo") { $chosen = $v; break } }
-          }
-          if (-not $chosen) {
-            Write-Warning "No published binary cache found - dependencies will be built from source (very slow)."
+            Write-Warning "No published RelWithDebInfo binary cache found - dependencies will be built from source (very slow, may time out)."
           } else {
             $lines = [System.Collections.Generic.List[string]](Get-Content $ini)
+
+            # Ensure [Packager] section exists and set CacheVersion
             $idx = -1
-            for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].Trim() -eq '[Packager]') { $idx = $i; break } }
-            if ($idx -ge 0) { $lines.Insert($idx + 1, "CacheVersion = $chosen") }
-            else { $lines.Add(""); $lines.Add("[Packager]"); $lines.Add("CacheVersion = $chosen") }
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i].Trim() -eq '[Packager]') { $idx = $i; break }
+            }
+            if ($idx -ge 0) {
+              # Remove any existing CacheVersion line under [Packager]
+              for ($j = $idx + 1; $j -lt $lines.Count; $j++) {
+                if ($lines[$j] -match '^\s*\[') { break }
+                if ($lines[$j] -match '^\s*CacheVersion\s*=') {
+                  $lines.RemoveAt($j)
+                  break
+                }
+              }
+              $lines.Insert($idx + 1, "CacheVersion = $chosen")
+            } else {
+              $lines.Add("")
+              $lines.Add("[Packager]")
+              $lines.Add("CacheVersion = $chosen")
+            }
+
+            # Force the build type that matches the cache
+            $btIdx = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^\s*BuildType\s*=') { $btIdx = $i; break }
+            }
+            if ($btIdx -ge 0) {
+              $lines[$btIdx] = "BuildType = RelWithDebInfo"
+            } else {
+              # try to put it under [Compile]
+              $compileIdx = -1
+              for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i].Trim() -eq '[Compile]') { $compileIdx = $i; break }
+              }
+              if ($compileIdx -ge 0) {
+                $lines.Insert($compileIdx + 1, "BuildType = RelWithDebInfo")
+              } else {
+                $lines.Add("")
+                $lines.Add("[Compile]")
+                $lines.Add("BuildType = RelWithDebInfo")
+              }
+            }
+
             Set-Content -Path $ini -Value $lines
-            Write-Host "Pinned CacheVersion = $chosen"
+            Write-Host "Pinned CacheVersion = $chosen  and  BuildType = RelWithDebInfo"
           }
-          Get-Content $ini | Select-String -Pattern 'CacheVersion|RepositoryUrl|^\[Packager\]'
+
+          Write-Host "---- relevant CraftSettings.ini lines ----"
+          Get-Content $ini | Select-String -Pattern 'CacheVersion|BuildType|RepositoryUrl|^\[Packager\]|^\[Compile\]'
 
       - name: Build and package Kdenlive
         shell: pwsh
         run: |
-          # craftenv.ps1 wipes and rebuilds the whole environment, so save what we need first.
           $root    = $env:CRAFT_ROOT
           $target  = $env:KD_TARGET
           $btype   = $env:KD_BUILD_TYPE
           $package = $env:KD_PACKAGE -eq 'true'
+
           $env:PATH = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer;$env:PATH"
 
-          # craftenv.ps1 starts with `cls`, which throws on a non-interactive console.
+          # craftenv.ps1 starts with `cls`, which throws on a non-interactive console
           Remove-Item Alias:cls, Alias:clear -Force -ErrorAction SilentlyContinue
           function Global:cls {}
           function Global:clear {}
@@ -188,8 +225,18 @@ jobs:
 
           . "$root\craft\craftenv.ps1"
 
-          $opts = @("--ci-mode", "--output-on-failure", "--use-cache", "--buildtype", $btype)
-          if ($target -ne "release") { $opts += "--target=$target" }
+          # Always use the cache and the build type that matches it
+          $opts = @(
+            "--ci-mode",
+            "--output-on-failure",
+            "--use-cache",
+            "--buildtype", $btype
+          )
+          if ($target -ne "release") {
+            $opts += "--target=$target"
+          }
+
+          Write-Host "Running: craft $($opts -join ' ') kdenlive"
 
           craft @opts kdenlive
           if ($LASTEXITCODE -ne 0) {
@@ -210,8 +257,11 @@ jobs:
           $exe = Join-Path $env:CRAFT_ROOT "bin\kdenlive.exe"
           if (-not (Test-Path $exe)) { throw "kdenlive.exe not found at $exe" }
           Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
           $melt = Join-Path $env:CRAFT_ROOT "bin\melt.exe"
-          if (Test-Path $melt) { & $melt -version 2>&1 | Select-Object -First 3 }
+          if (Test-Path $melt) {
+            & $melt -version 2>&1 | Select-Object -First 5
+          }
 
       - name: Collect packages
         if: ${{ always() }}
@@ -220,7 +270,7 @@ jobs:
           $out = Join-Path $env:GITHUB_WORKSPACE "artifacts"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $ext = '.exe', '.7z', '.zip', '.appx', '.msix'
-          # Craft's default package directory is <CraftRoot>\tmp; fall back to a wider search.
+
           $found = @()
           $tmp = Join-Path $env:CRAFT_ROOT "tmp"
           if (Test-Path $tmp) {
@@ -229,7 +279,12 @@ jobs:
           }
           if (-not $found) {
             $found = Get-ChildItem $env:CRAFT_ROOT -Recurse -File -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -like 'kdenlive*' -and $ext -contains $_.Extension -and $_.Length -gt 1MB -and $_.FullName -notmatch '\\(build|download|bin|lib)\\' }
+              Where-Object {
+                $_.Name -like 'kdenlive*' -and
+                $ext -contains $_.Extension -and
+                $_.Length -gt 1MB -and
+                $_.FullName -notmatch '\\(build|download|bin|lib)\\'
+              }
           }
           $found | ForEach-Object { Copy-Item $_.FullName $out -Force }
           Get-ChildItem $out | Format-Table Name, Length
