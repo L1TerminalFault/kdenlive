@@ -11,39 +11,34 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v6
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
 
-    - name: Set up KDE Craft
-      shell: pwsh
-      run: |
-        # 1. Create directory and clone Craft blueprint manager
-        mkdir C:\craft
-        git clone https://github.com/KDE/craft.git C:\craft
+      - name: Set up KDE Craft
+        shell: pwsh
+        run: |
+          mkdir C:\craft
+          git clone https://github.com/KDE/craft.git C:\craft
+          python C:\craft\bin\craft.py --setup --yes
 
-        # 2. Run initial non-interactive Craft setup
-        python C:\craft\bin\craft.py --setup --yes
+      - name: Install Dependencies & Build Kdenlive
+        shell: pwsh
+        run: |
+          python C:\craft\bin\craft.py --install-deps kdenlive
+          python C:\craft\bin\craft.py kdenlive
 
-    - name: Install Dependencies & Build Kdenlive
-      shell: pwsh
-      run: |
-        # Craft automatically handles Qt, MLT, FFmpeg, and KF6 dependencies
-        python C:\craft\bin\craft.py --install-deps kdenlive
-        python C:\craft\bin\craft.py kdenlive
+      - name: Package Windows Binary
+        shell: pwsh
+        run: |
+          python C:\craft\bin\craft.py --package kdenlive
 
-    - name: Package Windows Binary
-      shell: pwsh
-      run: |
-        # Bundle everything into a standalone installer or zip package
-        python C:\craft\bin\craft.py --package kdenlive
-
-    - name: Upload Windows Package
-      uses: actions/upload-artifact@v4
-      with:
-        name: kdenlive-craft-windows-package
-        path: C:\craft\tmp\*.exe
+      - name: Upload Windows Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdenlive-craft-windows-package
+          path: C:\craft\tmp\*.exe
