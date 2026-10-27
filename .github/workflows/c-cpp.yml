@@ -33,6 +33,8 @@ env:
   KD_TARGET: ${{ github.event.inputs.target || 'master' }}
   KD_BUILD_TYPE: ${{ github.event.inputs.build_type || 'RelWithDebInfo' }}
   KD_PACKAGE: ${{ github.event.inputs.package || 'true' }}
+  PYTHONUTF8: "1"
+  GIT_TERMINAL_PROMPT: "0"
 
 jobs:
   build:
@@ -47,6 +49,9 @@ jobs:
           git config --global core.longpaths true
           git config --global core.autocrlf false
           Get-PSDrive C | Format-Table Name, Used, Free
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe")) {
+            throw "vswhere.exe not found - Visual Studio is required by Craft's MSVC ABI"
+          }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,39 +59,70 @@ jobs:
           python-version: "3.12"
           architecture: x64
 
-      # CraftBootstrap.py is exactly what KDE's install_craft.ps1 runs. We call it
-      # directly because the .ps1 wrapper has interactive prompts that hang CI.
-      # --use-defaults selects: Microsoft Visual Studio 2022, x86_64 (the ABI KDE's
-      # binary cache is built for), short-path dir C:\_, default install root.
+      # invent.kde.org returns "403 Forbidden" to plain HTTP downloads from GitHub's
+      # runners (it blocks scripted/non-browser clients), so we never download from it
+      # over HTTP. Craft itself is cloned from KDE's official GitHub mirror and passed
+      # to the bootstrap via --localDev.
+      #
+      # Craft later clones its blueprints and the Kdenlive source over git. If git
+      # access to invent.kde.org works from this runner we leave it alone; if not, we
+      # transparently redirect those clones to the matching GitHub mirrors.
       - name: Bootstrap Craft
         shell: pwsh
         run: |
           python -m pip install --upgrade certifi
+
+          # --- git access check / mirror fallback -------------------------------------
+          $ErrorActionPreference = 'Continue'
+          git ls-remote https://invent.kde.org/packaging/craft-blueprints-kde.git HEAD *> $null
+          $inventOk = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = 'Stop'
+          if ($inventOk) {
+            Write-Host "invent.kde.org git access works - using it directly."
+          } else {
+            Write-Warning "invent.kde.org not reachable via git - redirecting clones to GitHub mirrors."
+            git config --global url."https://github.com/KDE/craft".insteadOf       "https://invent.kde.org/packaging/craft"
+            git config --global url."https://github.com/KDE/kdenlive".insteadOf    "https://invent.kde.org/multimedia/kdenlive"
+            git config --global url."https://github.com/KDE/kshim".insteadOf       "https://invent.kde.org/sdk/kshim"
+          }
+
+          # --- get Craft from the GitHub mirror ---------------------------------------
+          $craftSrc = Join-Path $env:RUNNER_TEMP "craft-src"
+          git clone --depth 1 --branch master https://github.com/KDE/craft.git $craftSrc
+          if ($LASTEXITCODE -ne 0) { throw "Could not clone https://github.com/KDE/craft.git" }
+
+          # --- bootstrap (non-interactive) --------------------------------------------
           New-Item -ItemType Directory -Force -Path "$env:CRAFT_ROOT\download" | Out-Null
-          $bootstrap = Join-Path $env:RUNNER_TEMP "CraftBootstrap.py"
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri "https://invent.kde.org/packaging/craft/-/raw/master/setup/CraftBootstrap.py" `
-            -OutFile $bootstrap
-          python $bootstrap --prefix "$env:CRAFT_ROOT" --branch master --use-defaults
-          if ($LASTEXITCODE -ne 0) { throw "Craft bootstrap failed" }
+          python "$craftSrc\setup\CraftBootstrap.py" `
+            --prefix "$env:CRAFT_ROOT" `
+            --branch master `
+            --localDev "$craftSrc" `
+            --use-defaults
+          if ($LASTEXITCODE -ne 0) { throw "Craft bootstrap failed ($LASTEXITCODE)" }
 
           $abi = (Select-String -Path "$env:CRAFT_ROOT\etc\CraftSettings.ini" -Pattern '^\s*ABI\s*=').Line
           Write-Host "Craft ABI -> $abi"
           if ($abi -notmatch 'msvc2022') { throw "Unexpected ABI: $abi" }
 
-      - name: Build Kdenlive (dependencies come from KDE's binary cache)
+      - name: Build and package Kdenlive
         shell: pwsh
         run: |
-          # Save what we need: craftenv.ps1 clears and rebuilds the whole environment.
-          $root   = $env:CRAFT_ROOT
-          $target = $env:KD_TARGET
-          $btype  = $env:KD_BUILD_TYPE
-          $vswhereDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-          $env:PATH = "$vswhereDir;$env:PATH"
+          # craftenv.ps1 wipes and rebuilds the whole environment, so save what we need first.
+          $root    = $env:CRAFT_ROOT
+          $target  = $env:KD_TARGET
+          $btype   = $env:KD_BUILD_TYPE
+          $package = $env:KD_PACKAGE -eq 'true'
+          $env:PATH = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer;$env:PATH"
+
+          # craftenv.ps1 starts with `cls`, which throws on a non-interactive console.
+          Remove-Item Alias:cls, Alias:clear -Force -ErrorAction SilentlyContinue
+          function Global:cls {}
+          function Global:clear {}
+          function Global:Clear-Host {}
 
           . "$root\craft\craftenv.ps1"
 
-          $opts = @("--ci-mode", "--output-on-failure", "--buildtype", $btype)
+          $opts = @("--ci-mode", "--output-on-failure", "--use-cache", "--buildtype", $btype)
           if ($target -ne "release") { $opts += "--target=$target" }
 
           craft @opts kdenlive
@@ -97,6 +133,11 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { throw "craft kdenlive failed ($LASTEXITCODE)" }
 
+          if ($package) {
+            craft @opts --package kdenlive
+            if ($LASTEXITCODE -ne 0) { throw "craft --package failed ($LASTEXITCODE)" }
+          }
+
       - name: Smoke test
         shell: pwsh
         run: |
@@ -106,44 +147,32 @@ jobs:
           $melt = Join-Path $env:CRAFT_ROOT "bin\melt.exe"
           if (Test-Path $melt) { & $melt -version 2>&1 | Select-Object -First 3 }
 
-      - name: Package installer
-        if: ${{ env.KD_PACKAGE == 'true' }}
-        shell: pwsh
-        run: |
-          $root   = $env:CRAFT_ROOT
-          $target = $env:KD_TARGET
-          $btype  = $env:KD_BUILD_TYPE
-          $vswhereDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-          $env:PATH = "$vswhereDir;$env:PATH"
-
-          . "$root\craft\craftenv.ps1"
-
-          $opts = @("--ci-mode", "--output-on-failure", "--buildtype", $btype)
-          if ($target -ne "release") { $opts += "--target=$target" }
-
-          craft @opts --package kdenlive
-          if ($LASTEXITCODE -ne 0) { throw "craft --package failed ($LASTEXITCODE)" }
-
-      # Craft's default package output directory is <CraftRoot>\tmp
       - name: Collect packages
         if: ${{ always() }}
         shell: pwsh
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE "artifacts"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $ext = '.exe', '.7z', '.zip', '.appx', '.msix'
+          # Craft's default package directory is <CraftRoot>\tmp; fall back to a wider search.
+          $found = @()
           $tmp = Join-Path $env:CRAFT_ROOT "tmp"
           if (Test-Path $tmp) {
-            Get-ChildItem $tmp -File -ErrorAction SilentlyContinue |
-              Where-Object { $_.Extension -in '.exe', '.7z', '.zip', '.appx', '.msix' -and $_.Length -gt 1MB } |
-              ForEach-Object { Copy-Item $_.FullName $out -Force }
+            $found = Get-ChildItem $tmp -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $ext -contains $_.Extension -and $_.Length -gt 1MB }
           }
+          if (-not $found) {
+            $found = Get-ChildItem $env:CRAFT_ROOT -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'kdenlive*' -and $ext -contains $_.Extension -and $_.Length -gt 1MB -and $_.FullName -notmatch '\\(build|download|bin|lib)\\' }
+          }
+          $found | ForEach-Object { Copy-Item $_.FullName $out -Force }
           Get-ChildItem $out | Format-Table Name, Length
 
       - name: Upload packages
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: kdenlive-windows-${{ env.KD_TARGET }}-${{ env.KD_BUILD_TYPE }}
+          name: kdenlive-windows-${{ github.run_number }}
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 14
@@ -152,7 +181,7 @@ jobs:
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: kdenlive-craft-logs
+          name: kdenlive-craft-logs-${{ github.run_number }}
           path: |
             C:\CraftRoot\etc\CraftSettings.ini
             C:\CraftRoot\logs\**
