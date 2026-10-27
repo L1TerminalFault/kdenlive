@@ -1,4 +1,4 @@
-name: C/C++ CI - KDE Craft Windows Build
+name: C/C++ CI - Windows Build
 
 on:
   push:
@@ -14,31 +14,60 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v6
 
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - name: Setup MSYS2 Environment
+        uses: msys2/setup-msys2@v2
         with:
-          python-version: '3.11'
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-declarative
+            mingw-w64-x86_64-qt6-svg
+            mingw-w64-x86_64-qt6-multimedia
+            mingw-w64-x86_64-mlt
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-frei0r-plugins
+            mingw-w64-x86_64-rttr
+            mingw-w64-x86_64-kf6-kcoreaddons
+            mingw-w64-x86_64-kf6-kxmlgui
+            mingw-w64-x86_64-kf6-kwidgetsaddons
+            mingw-w64-x86_64-kf6-karchive
+            mingw-w64-x86_64-kf6-kconfig
+            mingw-w64-x86_64-kf6-ki18n
+            mingw-w64-x86_64-kf6-kio
+            mingw-w64-x86_64-kf6-kiconthemes
+            mingw-w64-x86_64-kf6-knotifications
+            mingw-w64-x86_64-kf6-kdbusaddons
 
-      - name: Set up KDE Craft
-        shell: pwsh
+      - name: Configure CMake
+        shell: msys2 {0}
         run: |
-          mkdir C:\craft
-          git clone https://github.com/KDE/craft.git C:\craft
-          python C:\craft\bin\craft.py --setup --yes
+          mkdir build
+          cd build
+          cmake -G Ninja .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF
 
-      - name: Install Dependencies & Build Kdenlive
-        shell: pwsh
+      - name: Compile with Ninja
+        shell: msys2 {0}
         run: |
-          python C:\craft\bin\craft.py --install-deps kdenlive
-          python C:\craft\bin\craft.py kdenlive
+          cd build
+          ninja
 
-      - name: Package Windows Binary
-        shell: pwsh
+      - name: Bundle and Deploy DLLs
+        shell: msys2 {0}
         run: |
-          python C:\craft\bin\craft.py --package kdenlive
+          mkdir release
+          cp build/bin/kdenlive.exe release/
+          windeployqt6 release/kdenlive.exe
 
-      - name: Upload Windows Package
+      - name: Upload Windows Executable Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kdenlive-craft-windows-package
-          path: C:\craft\tmp\*.exe
+          name: kdenlive-windows-executable
+          path: release/
