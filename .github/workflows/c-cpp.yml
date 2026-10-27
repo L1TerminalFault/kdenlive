@@ -16,6 +16,10 @@ on:
           - RelWithDebInfo
           - Release
           - Debug
+      craft_ref:
+        description: "Craft revision (commit SHA, or 'master'). Default pins the last commit before Craft's bootstrap switched to a from-source curl build whose binary cache is not published yet"
+        required: false
+        default: "1b3bc65448faedea76758752bc77c448670ba43c"
       package:
         description: "Also create the Windows installer/archive"
         required: false
@@ -33,6 +37,7 @@ env:
   KD_TARGET: ${{ github.event.inputs.target || 'master' }}
   KD_BUILD_TYPE: ${{ github.event.inputs.build_type || 'RelWithDebInfo' }}
   KD_PACKAGE: ${{ github.event.inputs.package || 'true' }}
+  KD_CRAFT_REF: ${{ github.event.inputs.craft_ref || '1b3bc65448faedea76758752bc77c448670ba43c' }}
   PYTHONUTF8: "1"
   GIT_TERMINAL_PROMPT: "0"
 
@@ -88,8 +93,14 @@ jobs:
 
           # --- get Craft from the GitHub mirror ---------------------------------------
           $craftSrc = Join-Path $env:RUNNER_TEMP "craft-src"
-          git clone --depth 1 --branch master https://github.com/KDE/craft.git $craftSrc
-          if ($LASTEXITCODE -ne 0) { throw "Could not clone https://github.com/KDE/craft.git" }
+          New-Item -ItemType Directory -Force -Path $craftSrc | Out-Null
+          git -C $craftSrc init -q
+          git -C $craftSrc remote add origin https://github.com/KDE/craft.git
+          git -C $craftSrc fetch -q --depth 1 origin $env:KD_CRAFT_REF
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch Craft revision $env:KD_CRAFT_REF from GitHub" }
+          git -C $craftSrc checkout -q FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Could not check out Craft revision $env:KD_CRAFT_REF" }
+          Write-Host ("Craft revision: " + (git -C $craftSrc log -1 --format='%h %ad %s' --date=short))
 
           # --- bootstrap (non-interactive) --------------------------------------------
           New-Item -ItemType Directory -Force -Path "$env:CRAFT_ROOT\download" | Out-Null
@@ -99,6 +110,22 @@ jobs:
             --localDev "$craftSrc" `
             --use-defaults
           if ($LASTEXITCODE -ne 0) { throw "Craft bootstrap failed ($LASTEXITCODE)" }
+
+          # The last bootstrap step (craft/craft-core) installs Craft's *current* master over
+          # the pinned copy. Put the pinned revision back so later `craft` runs keep the
+          # old, cache-friendly bootstrap requirements.
+          $craftDir = Join-Path $env:CRAFT_ROOT "craft"
+          if (Test-Path (Join-Path $craftDir ".git")) {
+            git -C $craftDir fetch -q --depth 1 https://github.com/KDE/craft.git $env:KD_CRAFT_REF
+            if ($LASTEXITCODE -ne 0) { throw "Could not fetch pinned Craft revision into $craftDir" }
+            git -C $craftDir checkout -q -f FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "Could not check out pinned Craft revision in $craftDir" }
+          } else {
+            robocopy $craftSrc $craftDir /E /XD .git /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy of pinned Craft failed ($LASTEXITCODE)" }
+            $global:LASTEXITCODE = 0
+          }
+          Write-Host ("Active Craft: " + (git -C $craftDir log -1 --format='%h %ad %s' --date=short 2>$null))
 
           $abi = (Select-String -Path "$env:CRAFT_ROOT\etc\CraftSettings.ini" -Pattern '^\s*ABI\s*=').Line
           Write-Host "Craft ABI -> $abi"
