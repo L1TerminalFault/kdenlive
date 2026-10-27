@@ -1,73 +1,172 @@
-name: C/C++ CI - Windows Build
+name: Kdenlive Windows Build
 
 on:
-  push:
-    branches: [ "test" ]
-  pull_request:
-    branches: [ "test" ]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Kdenlive target: 'master' (git HEAD) or a release version (e.g. 25.08.0)"
+        required: false
+        default: "master"
+      build_type:
+        description: "Build type"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - RelWithDebInfo
+          - Debug
+      package:
+        description: "Create installer/portable packages"
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    - cron: "0 3 * * 0"   # weekly nightly-style build (Sunday 03:00 UTC)
+
+# Craft's tree is large; keep it on a short path to avoid MAX_PATH problems.
+env:
+  CRAFT_ROOT: C:\CraftRoot
+  CRAFT_TARGET: ${{ github.event.inputs.target || 'master' }}
+  CRAFT_BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+  CRAFT_PACKAGE: ${{ github.event.inputs.package || 'true' }}
+
+concurrency:
+  group: kdenlive-windows-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Kdenlive (Windows x64, MinGW, Craft)
+    runs-on: windows-2022
+    timeout-minutes: 350      # GitHub-hosted limit is 360; a cold build is very long
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v6
+      - name: Free disk space / show environment
+        shell: pwsh
+        run: |
+          Get-PSDrive C | Format-Table Name, Used, Free
+          $PSVersionTable.PSVersion
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
 
-      - name: Setup MSYS2 Environment
-        uses: msys2/setup-msys2@v2
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            base-devel
-            git
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-qt6-base
-            mingw-w64-x86_64-qt6-declarative
-            mingw-w64-x86_64-qt6-svg
-            mingw-w64-x86_64-qt6-multimedia
-            mingw-w64-x86_64-mlt
-            mingw-w64-x86_64-ffmpeg
-            mingw-w64-x86_64-frei0r-plugins
-            mingw-w64-x86_64-rttr
-            mingw-w64-x86_64-kf6-kcoreaddons
-            mingw-w64-x86_64-kf6-kxmlgui
-            mingw-w64-x86_64-kf6-kwidgetsaddons
-            mingw-w64-x86_64-kf6-karchive
-            mingw-w64-x86_64-kf6-kconfig
-            mingw-w64-x86_64-kf6-ki18n
-            mingw-w64-x86_64-kf6-kio
-            mingw-w64-x86_64-kf6-kiconthemes
-            mingw-w64-x86_64-kf6-knotifications
-            mingw-w64-x86_64-kf6-kdbusaddons
+          python-version: "3.12"
+          architecture: x64
 
-      - name: Configure CMake
-        shell: msys2 {0}
+      # Cache Craft's download dir (source tarballs/git clones) – cheap and safe.
+      # Caching the whole CraftRoot can exceed GitHub's cache limits, so it is
+      # split: downloads always, full root only if you want faster rebuilds.
+      - name: Cache Craft downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CRAFT_ROOT }}\download
+          key: craft-download-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            craft-download-${{ runner.os }}-
+
+      - name: Bootstrap Craft
+        shell: pwsh
         run: |
-          mkdir build
-          cd build
-          cmake -G Ninja .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF
+          New-Item -ItemType Directory -Force -Path $env:CRAFT_ROOT | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/KDE/craft/master/setup/CraftBootstrap.py" `
+            -OutFile "$env:CRAFT_ROOT\CraftBootstrap.py"
+          # MinGW (64-bit) is the compiler recommended by the Kdenlive team.
+          python "$env:CRAFT_ROOT\CraftBootstrap.py" `
+            --prefix "$env:CRAFT_ROOT" `
+            --branch master `
+            --no-interactive `
+            --compiler mingw `
+            --architecture x64
+        # NOTE: if your Craft version rejects one of the flags above, run
+        # `python CraftBootstrap.py --help` and adjust. The interactive
+        # equivalent is: compiler = mingw-w64, architecture = x64.
 
-      - name: Compile with Ninja
-        shell: msys2 {0}
+      - name: Configure Craft
+        shell: pwsh
         run: |
-          cd build
-          ninja
+          $ini = "$env:CRAFT_ROOT\etc\CraftSettings.ini"
+          Add-Content $ini "`n[ContinuousIntegration]"
+          Add-Content $ini "Enabled = True"
+          Add-Content $ini "`n[General]"
+          Add-Content $ini "Options = ""[Packager]PackageType=Portable"""
+          Get-Content $ini
 
-      - name: Bundle and Deploy DLLs
-        shell: msys2 {0}
+      - name: Update Craft and blueprints
+        shell: pwsh
         run: |
-          mkdir release
-          cp build/bin/kdenlive.exe release/
-          windeployqt6 release/kdenlive.exe
+          & "$env:CRAFT_ROOT\craft\craftenv.ps1"
+          craft craft
+          craft --fetch-blueprints 2>$null; if ($LASTEXITCODE -ne 0) { craft --update-all-blueprints 2>$null }
 
-      - name: Upload Windows Executable Artifact
+      - name: Build Kdenlive and all dependencies
+        shell: pwsh
+        run: |
+          & "$env:CRAFT_ROOT\craft\craftenv.ps1"
+          $args = @("--buildtype", $env:CRAFT_BUILD_TYPE, "--yes")
+          if ($env:CRAFT_TARGET -ne "release") { $args += "--target=$env:CRAFT_TARGET" }
+          # Known quirk from the Kdenlive wiki: if the first run fails on zlib,
+          # build zlib on its own and retry.
+          craft @args kdenlive
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "First attempt failed, retrying after building zlib"
+            craft zlib
+            craft @args kdenlive
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test (binary exists and starts)
+        shell: pwsh
+        run: |
+          & "$env:CRAFT_ROOT\craft\craftenv.ps1"
+          $exe = Join-Path $env:CRAFT_ROOT "bin\kdenlive.exe"
+          if (-not (Test-Path $exe)) { throw "kdenlive.exe not found at $exe" }
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+          & "$env:CRAFT_ROOT\bin\melt.exe" -version 2>&1 | Select-Object -First 3
+
+      - name: Package (installer + portable)
+        if: ${{ env.CRAFT_PACKAGE == 'true' }}
+        shell: pwsh
+        run: |
+          & "$env:CRAFT_ROOT\craft\craftenv.ps1"
+          $args = @("--buildtype", $env:CRAFT_BUILD_TYPE, "--yes")
+          if ($env:CRAFT_TARGET -ne "release") { $args += "--target=$env:CRAFT_TARGET" }
+          craft @args --package kdenlive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect artifacts
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\artifacts"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          # Craft writes packages to its tmp/ and/or cache dirs depending on version.
+          Get-ChildItem -Path $env:CRAFT_ROOT -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^kdenlive.*\.(exe|7z|zip|appx|msix)$' -and $_.Length -gt 1MB } |
+            ForEach-Object { Copy-Item $_.FullName $out -Force; Write-Host "Collected $($_.Name)" }
+          Get-ChildItem $out
+
+      - name: Upload packages
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: kdenlive-windows-executable
-          path: release/
+          name: kdenlive-windows-${{ env.CRAFT_TARGET }}-${{ env.CRAFT_BUILD_TYPE }}
+          path: artifacts/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdenlive-craft-logs
+          path: |
+            ${{ env.CRAFT_ROOT }}\logs\**
+            ${{ env.CRAFT_ROOT }}\build\**\*.log
+            ${{ env.CRAFT_ROOT }}\build\**\CMakeError.log
+            ${{ env.CRAFT_ROOT }}\build\**\CMakeOutput.log
+          if-no-files-found: ignore
+          retention-days: 7
