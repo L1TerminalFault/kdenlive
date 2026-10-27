@@ -104,6 +104,45 @@ jobs:
           Write-Host "Craft ABI -> $abi"
           if ($abi -notmatch 'msvc2022') { throw "Unexpected ABI: $abi" }
 
+      # Craft master points at binary-cache version "26.10", which KDE has not published
+      # yet (files.kde.org answers 404), so every dependency would be compiled from
+      # source and the build would run out of time. This step probes the published cache
+      # versions, newest first, and pins the first one that exists.
+      - name: Select an available binary cache
+        shell: pwsh
+        run: |
+          $ini = "$env:CRAFT_ROOT\etc\CraftSettings.ini"
+          # Versions that exist on https://files.kde.org/craft/Qt6/ (newest first).
+          $candidates = @("26.10", "26.05", "26.02")
+          function Test-Manifest($v, $bt) {
+            $url = "https://files.kde.org/craft/Qt6/$v/windows/cl/msvc2022/x86_64/$bt/manifest.json"
+            curl.exe -s -f -L -I -o NUL $url
+            $ok = ($LASTEXITCODE -eq 0)
+            Write-Host ("  {0,-10} {1,-15} {2}" -f $v, $bt, $(if ($ok) { "found" } else { "missing" }))
+            return $ok
+          }
+          $chosen = $null
+          # Pass 1: a version that has BOTH RelWithDebInfo (Kdenlive + libs) and MinSizeRel (Craft's dev-utils).
+          foreach ($v in $candidates) {
+            if ((Test-Manifest $v "RelWithDebInfo") -and (Test-Manifest $v "MinSizeRel")) { $chosen = $v; break }
+          }
+          # Pass 2: a version with at least RelWithDebInfo.
+          if (-not $chosen) {
+            foreach ($v in $candidates) { if (Test-Manifest $v "RelWithDebInfo") { $chosen = $v; break } }
+          }
+          if (-not $chosen) {
+            Write-Warning "No published binary cache found - dependencies will be built from source (very slow)."
+          } else {
+            $lines = [System.Collections.Generic.List[string]](Get-Content $ini)
+            $idx = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].Trim() -eq '[Packager]') { $idx = $i; break } }
+            if ($idx -ge 0) { $lines.Insert($idx + 1, "CacheVersion = $chosen") }
+            else { $lines.Add(""); $lines.Add("[Packager]"); $lines.Add("CacheVersion = $chosen") }
+            Set-Content -Path $ini -Value $lines
+            Write-Host "Pinned CacheVersion = $chosen"
+          }
+          Get-Content $ini | Select-String -Pattern 'CacheVersion|RepositoryUrl|^\[Packager\]'
+
       - name: Build and package Kdenlive
         shell: pwsh
         run: |
